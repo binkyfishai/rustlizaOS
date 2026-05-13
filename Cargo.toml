@@ -10,6 +10,7 @@ members = [
     "crates/client-telegram",
     "crates/model-openai",
     "crates/client-twitter",
+    "crates/plugin-coding",
     "crates/client-cli",
 ]
 resolver = "2"

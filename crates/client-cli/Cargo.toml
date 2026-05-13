@@ -19,6 +19,7 @@ rustliza-server-api = { path = "../server-api" }
 rustliza-client-discord = { path = "../client-discord" }
 rustliza-client-telegram = { path = "../client-telegram" }
 rustliza-client-twitter = { path = "../client-twitter" }
+rustliza-plugin-coding = { path = "../plugin-coding" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,3 +32,4 @@ clap = { version = "4", features = ["derive", "env"] }
 rustyline = "15"
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+dotenvy = "0.15"

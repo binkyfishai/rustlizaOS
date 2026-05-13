@@ -1,0 +1,14 @@
+[package]
+name = "rustliza-plugin-coding"
+version = "0.1.0"
+edition = "2021"
+description = "Autonomous coding plugin — file ops, shell, git, search, iterative task loop"
+
+[dependencies]
+rustliza-core = { path = "../core" }
+tokio = { workspace = true }
+regex = "1"
+tracing = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

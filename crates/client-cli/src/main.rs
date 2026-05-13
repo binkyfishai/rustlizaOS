@@ -88,10 +88,16 @@ struct Cli {
     /// Run headless (no REPL — just services)
     #[arg(long)]
     headless: bool,
+
+    /// Project directory for autonomous coding (enables coding plugin)
+    #[arg(long)]
+    project_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -162,7 +168,14 @@ async fn main() -> anyhow::Result<()> {
             model_provider.clone(),
         )));
 
-    if cli.action_planning {
+    if let Some(ref project_dir) = cli.project_dir {
+        let dir = project_dir.canonicalize().with_context(|| {
+            format!("project dir {:?} does not exist", project_dir)
+        })?;
+        builder = builder.plugin(rustliza_plugin_coding::coding_plugin(dir.clone()));
+        builder = builder.enable_action_planning();
+        info!(path = ?dir, "coding plugin enabled");
+    } else if cli.action_planning {
         builder = builder.enable_action_planning();
     }
 
@@ -204,8 +217,11 @@ async fn main() -> anyhow::Result<()> {
     if cli.api {
         let rt = runtime.clone() as Arc<dyn Runtime>;
         let bind = cli.api_bind.clone();
+        let project_dir = cli.project_dir.as_ref().and_then(|p| p.canonicalize().ok());
         tokio::spawn(async move {
-            if let Err(e) = rustliza_server_api::start_server(rt, &bind).await {
+            if let Err(e) =
+                rustliza_server_api::start_server_with_options(rt, &bind, project_dir).await
+            {
                 error!(error = %e, "API server error");
             }
         });
@@ -275,6 +291,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if cli.twitter_token.is_some() {
         println!("  Twitter:  connected");
+    }
+    if let Some(ref dir) = cli.project_dir {
+        println!("  Project: {:?}", dir);
     }
     println!("  Type a message to chat. Ctrl-D or 'exit' to quit.");
     println!();
