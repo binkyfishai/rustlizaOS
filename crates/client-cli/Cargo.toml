@@ -1,0 +1,33 @@
+[package]
+name = "rustliza"
+version = "0.1.0"
+edition = "2021"
+description = "Rustliza — a Rust rewrite of ElizaOS"
+
+[[bin]]
+name = "rustliza"
+path = "src/main.rs"
+
+[dependencies]
+rustliza-core = { path = "../core" }
+rustliza-db-sqlite = { path = "../db-sqlite" }
+rustliza-model-anthropic = { path = "../model-anthropic" }
+rustliza-model-openai = { path = "../model-openai" }
+rustliza-plugin-bootstrap = { path = "../plugin-bootstrap" }
+rustliza-knowledge = { path = "../knowledge" }
+rustliza-server-api = { path = "../server-api" }
+rustliza-client-discord = { path = "../client-discord" }
+rustliza-client-telegram = { path = "../client-telegram" }
+rustliza-client-twitter = { path = "../client-twitter" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+rustyline = "15"
+futures = { workspace = true }
+tokio-stream = { workspace = true }

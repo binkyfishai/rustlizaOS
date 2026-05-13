@@ -1,0 +1,17 @@
+[package]
+name = "rustliza-db-sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite database adapter for Rustliza"
+
+[dependencies]
+rustliza-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }

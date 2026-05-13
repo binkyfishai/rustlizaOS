@@ -1,0 +1,20 @@
+[package]
+name = "rustliza-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core types, traits, and runtime for Rustliza — a Rust rewrite of ElizaOS"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+regex = "1"
+unicode-normalization = "0.1"
+futures = { workspace = true }
+tokio-stream = { workspace = true }

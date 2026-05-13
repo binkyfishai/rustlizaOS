@@ -1,0 +1,16 @@
+[package]
+name = "rustliza-model-openai"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible model provider for Rustliza (works with OpenAI, Ollama, vLLM, Together, etc.)"
+
+[dependencies]
+rustliza-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+futures = { workspace = true }
+tokio-stream = { workspace = true }

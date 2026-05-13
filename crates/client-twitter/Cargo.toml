@@ -1,0 +1,16 @@
+[package]
+name = "rustliza-client-twitter"
+version = "0.1.0"
+edition = "2021"
+description = "Twitter/X client for Rustliza — polls mentions and replies"
+
+[dependencies]
+rustliza-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
