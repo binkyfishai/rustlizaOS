@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -29,7 +31,7 @@ use rustliza_plugin_coding::CodingEvent;
 pub struct ApiState {
     pub runtime: Arc<dyn Runtime>,
     pub metrics: Option<Arc<rustliza_core::PipelineMetrics>>,
-    pub project_dir: Option<PathBuf>,
+    pub project_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl ApiState {
@@ -419,11 +421,11 @@ async fn run_task(
     Sse<impl futures::Stream<Item = std::result::Result<Event, std::convert::Infallible>>>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    let project_dir = state.project_dir.clone().ok_or_else(|| {
+    let project_dir = state.project_dir.read().await.clone().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "no project directory configured — start with --project-dir".into(),
+                error: "no project directory set — use /project <path> first".into(),
             }),
         )
     })?;
@@ -456,6 +458,69 @@ async fn run_task(
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+// ---------------------------------------------------------------------------
+// Project directory management
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct SetProjectRequest {
+    pub path: String,
+}
+
+#[derive(Serialize)]
+pub struct ProjectResponse {
+    pub path: Option<String>,
+}
+
+async fn set_project(
+    AxumState(state): AxumState<ApiState>,
+    Json(req): Json<SetProjectRequest>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let expanded = if req.path.starts_with('~') {
+        if let Some(home) = std::env::var("HOME").ok() {
+            PathBuf::from(req.path.replacen('~', &home, 1))
+        } else {
+            PathBuf::from(&req.path)
+        }
+    } else {
+        PathBuf::from(&req.path)
+    };
+
+    let canonical = expanded.canonicalize().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid path: {}", e),
+            }),
+        )
+    })?;
+
+    if !canonical.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "path is not a directory".into(),
+            }),
+        ));
+    }
+
+    let path_str = canonical.display().to_string();
+    *state.project_dir.write().await = Some(canonical);
+
+    Ok(Json(ProjectResponse {
+        path: Some(path_str),
+    }))
+}
+
+async fn get_project(
+    AxumState(state): AxumState<ApiState>,
+) -> impl IntoResponse {
+    let dir = state.project_dir.read().await;
+    Json(ProjectResponse {
+        path: dir.as_ref().map(|p| p.display().to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +635,7 @@ async function init() {
     $('#input').disabled = false;
     $('#send').disabled = false;
     $('#input').focus();
-    addSystem('connected. type to chat, or /code <task> for autonomous coding.');
+    addSystem('connected. /project <path> to set working dir, /code <task> for autonomous coding.');
   } catch(e) {
     $('#agent-name').textContent = 'offline';
     $('#status-dot').style.background = '#ef4444';
@@ -648,6 +713,19 @@ async function sendTask(task) {
   } catch(e) { addSystem('task stream error: ' + e.message); }
 }
 
+async function setProject(path) {
+  try {
+    const r = await fetch('/project', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({path})
+    });
+    const j = await r.json();
+    if (r.ok) addSystem('project set: ' + j.path);
+    else addSystem('error: ' + (j.error || 'failed'));
+  } catch(e) { addSystem('error: ' + e.message); }
+}
+
 async function send() {
   const text = $('#input').value.trim();
   if (!text || streaming) return;
@@ -659,6 +737,12 @@ async function send() {
 
   if (text.startsWith('/code ')) {
     await sendTask(text.slice(6));
+  } else if (text.startsWith('/project ')) {
+    await setProject(text.slice(9).trim());
+  } else if (text === '/project') {
+    const r = await fetch('/project');
+    const j = await r.json();
+    addSystem(j.path ? 'project: ' + j.path : 'no project set. use /project <path>');
   } else {
     await sendChat(text);
   }
@@ -698,6 +782,7 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/message/stream", post(send_message_stream))
         .route("/webhook", post(webhook))
         .route("/task", post(run_task))
+        .route("/project", get(get_project).post(set_project))
         .route("/rooms", post(create_room))
         .route("/rooms/{room_id}", get(get_room))
         .route("/rooms/{room_id}/memories", get(get_memories))
@@ -722,7 +807,7 @@ pub async fn start_server_with_options(
     let state = ApiState {
         runtime,
         metrics: None,
-        project_dir,
+        project_dir: Arc::new(RwLock::new(project_dir)),
     };
     let app = create_router(state);
 
