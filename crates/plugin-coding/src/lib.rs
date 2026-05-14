@@ -25,6 +25,9 @@ pub enum CodingEvent {
     Output(String),
     Done(String),
     Error(String),
+    Workspace { branch: String, dir: String },
+    FileChanged { path: String, action: String },
+    Iteration(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -343,9 +346,13 @@ pub async fn get_project_context(project_dir: &Path) -> String {
 
 fn coding_system_prompt(character: &Character, project_dir: &Path) -> String {
     format!(
-        r#"You are {name}, an autonomous coding agent working on the project at `{dir}`.
+        r#"You are {name}, a senior autonomous coding engineer working on the project at `{dir}`.
 
-You have these tools. Use them by writing the XML tags in your response:
+You ship working code. You do not ask for permission, you do not ask clarifying questions, you do not stall. You research with tools, you build, you test, you commit.
+
+You MUST use tools to accomplish tasks. Do NOT just describe what you would do — actually do it by writing the XML tool tags.
+
+## Available tools
 
 <read_file>path/to/file</read_file>
 Read a file and see its contents with line numbers.
@@ -372,24 +379,130 @@ Grep for a pattern across source files.
 List files in a directory (3 levels deep). Use "." for project root.
 
 <done>summary of what you accomplished</done>
-Signal that the current task is complete.
+Signal that the current task is complete. Only use this AFTER you have made all changes.
 
-## Rules
+## CRITICAL rules
+- You MUST include at least one tool tag in every response. Never respond with only text.
+- NEVER ask the user questions. Use your best judgment. If something is ambiguous, pick the most reasonable interpretation and build it.
+- If you don't know something, research with <run>curl -s https://...</run> or <search>. Don't say "I need more info" — go get the info.
+- Build a minimal working version FIRST, then iterate to improve it. Ship something that runs before perfecting.
+- You are working on an isolated git branch. Commit your progress frequently with <run>git add -A && git commit -m "..."</run>. Commits are checkpoints, not finalizations.
 - Always read a file before editing it.
 - Use <edit_file> for surgical changes. Use <write_file> for new files or full rewrites.
-- Run tests/builds after making changes to verify correctness.
-- You can use multiple tools in one response.
-- Think step-by-step but act decisively.
-- When finished, use <done> with a clear summary of changes made.
-- Be thorough — no partial implementations. If something breaks, fix it before finishing.
+- After making changes, RUN something to verify (build, tests, the program itself). Errors are signals, not failures — fix them.
+- If you create a new sub-project, create a folder, scaffold the structure, write the code, then build it.
+- You can use multiple tools in one response — chain them.
+- Do NOT use <done> until you have a working artifact and have committed it.
 - Follow the project's existing code style and conventions.
-- Commit meaningful checkpoints with <run>git add -A && git commit -m "message"</run>.
+
+## Example response
+
+Here is an example of a correct response when asked to add a README:
+
+I'll start by looking at the project structure.
+
+<ls>.</ls>
+
+After seeing the file listing, a correct follow-up would be:
+
+Now I'll create the README.
+
+<write_file path="README.md">
+# My Project
+
+Description here.
+</write_file>
+
+<done>Created README.md with project description.</done>
 
 {bio}"#,
         name = character.name,
         dir = project_dir.display(),
         bio = character.bio_text(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Workspace management — auto-creates a git branch per task
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub project_dir: PathBuf,
+    pub branch: String,
+    pub original_branch: String,
+    pub task_slug: String,
+}
+
+fn slugify(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+pub async fn create_workspace(project_dir: &Path, task: &str) -> Option<Workspace> {
+    let is_git = run_shell(project_dir, "git rev-parse --git-dir 2>/dev/null", 5)
+        .await
+        .contains(".git");
+    if !is_git {
+        info!("not a git repo, skipping branch workspace");
+        return None;
+    }
+
+    let original = run_shell(project_dir, "git branch --show-current 2>/dev/null", 5)
+        .await
+        .trim()
+        .to_string();
+
+    let slug = slugify(task);
+    let stamp = chrono::Utc::now().format("%H%M%S");
+    let branch = format!("botdick/{}-{}", slug, stamp);
+
+    let result = run_shell(project_dir, &format!("git checkout -b {} 2>&1", branch), 10).await;
+    if result.contains("Switched to a new branch") || result.contains("error") == false {
+        info!(branch = %branch, "created workspace branch");
+        Some(Workspace {
+            project_dir: project_dir.to_path_buf(),
+            branch,
+            original_branch: original,
+            task_slug: slug,
+        })
+    } else {
+        info!(error = %result, "failed to create branch");
+        None
+    }
+}
+
+pub async fn changed_files(project_dir: &Path) -> Vec<(String, String)> {
+    let out = run_shell(project_dir, "git status --porcelain 2>/dev/null", 5).await;
+    out.lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let status = line[..2].trim().to_string();
+            let path = line[3..].to_string();
+            let action = match status.as_str() {
+                "M" | "MM" | " M" => "modified",
+                "A" | "??" => "added",
+                "D" => "deleted",
+                "R" => "renamed",
+                _ => "changed",
+            };
+            Some((path, action.to_string()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -404,27 +517,42 @@ pub async fn run_coding_loop(
     tx: Option<tokio::sync::mpsc::Sender<CodingEvent>>,
 ) -> Result<String> {
     let character = runtime.character().clone();
-    let system = coding_system_prompt(&character, project_dir);
-
-    let mut messages: Vec<String> = vec![];
-
-    let project_context = get_project_context(project_dir).await;
-    messages.push(format!(
-        "## Project context:\n{}\n\n## Task:\n{}",
-        project_context, task
-    ));
 
     info!(task = %task, "coding loop started");
-    emit(&tx, CodingEvent::Status(format!("starting task: {}", task))).await;
+    emit(&tx, CodingEvent::Status(format!("starting: {}", task))).await;
+
+    // Create isolated git branch workspace
+    let workspace = create_workspace(project_dir, task).await;
+    if let Some(ws) = &workspace {
+        emit(
+            &tx,
+            CodingEvent::Workspace {
+                branch: ws.branch.clone(),
+                dir: ws.project_dir.display().to_string(),
+            },
+        )
+        .await;
+    }
+
+    let system = coding_system_prompt(&character, project_dir);
+    let mut messages: Vec<String> = vec![];
+    let mut no_tool_streak = 0u32;
+    let mut prev_changes: Vec<(String, String)> = vec![];
+
+    let project_context = get_project_context(project_dir).await;
+    let workspace_note = workspace
+        .as_ref()
+        .map(|ws| format!("Working on isolated branch `{}` (from `{}`).", ws.branch, ws.original_branch))
+        .unwrap_or_else(|| "Not a git repository — working directly in the project dir.".into());
+    messages.push(format!(
+        "## Workspace:\n{}\n\n## Project context:\n{}\n\n## Task:\n{}",
+        workspace_note, project_context, task
+    ));
 
     for iteration in 0..max_iterations {
         let prompt = messages.join("\n\n---\n\n");
 
-        emit(
-            &tx,
-            CodingEvent::Status(format!("iteration {}/{}", iteration + 1, max_iterations)),
-        )
-        .await;
+        emit(&tx, CodingEvent::Iteration(iteration + 1)).await;
 
         let response = runtime
             .generate_text(&GenerateTextParams {
@@ -443,10 +571,20 @@ pub async fn run_coding_loop(
         let tools = parse_tools(&response);
 
         if tools.is_empty() {
-            info!("no tools called, ending loop");
-            emit(&tx, CodingEvent::Done(response.clone())).await;
-            return Ok(response);
+            no_tool_streak += 1;
+            if no_tool_streak >= 3 {
+                info!("no tools called 3 times in a row, ending loop");
+                emit(&tx, CodingEvent::Done(response.clone())).await;
+                return Ok(response);
+            }
+            messages.push(format!(
+                "## Assistant:\n{}\n\n## System:\nYou did not use any tools. You MUST use tool tags to take action. Do not ask questions — make your best attempt. Start with <ls>.</ls> or <read_file> to explore, then build what was asked for.",
+                response
+            ));
+            continue;
         }
+
+        no_tool_streak = 0;
 
         let mut tool_log = format!(
             "## Assistant (iteration {}):\n{}\n\n## Tool results:\n",
@@ -476,6 +614,22 @@ pub async fn run_coding_loop(
         }
 
         messages.push(tool_log);
+
+        // Detect file changes and emit FileChanged events for any new ones
+        let now_changes = changed_files(project_dir).await;
+        for (path, action) in &now_changes {
+            if !prev_changes.iter().any(|(p, a)| p == path && a == action) {
+                emit(
+                    &tx,
+                    CodingEvent::FileChanged {
+                        path: path.clone(),
+                        action: action.clone(),
+                    },
+                )
+                .await;
+            }
+        }
+        prev_changes = now_changes;
 
         // Trim context if too large — keep first (project context) + last 3 exchanges
         let total_len: usize = messages.iter().map(|m| m.len()).sum();

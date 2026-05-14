@@ -453,6 +453,15 @@ async fn run_task(
             CodingEvent::Output(s) => ("output", s.clone()),
             CodingEvent::Done(s) => ("done", s.clone()),
             CodingEvent::Error(s) => ("error", s.clone()),
+            CodingEvent::Workspace { branch, dir } => (
+                "workspace",
+                serde_json::json!({"branch": branch, "dir": dir}).to_string(),
+            ),
+            CodingEvent::FileChanged { path, action } => (
+                "file-changed",
+                serde_json::json!({"path": path, "action": action}).to_string(),
+            ),
+            CodingEvent::Iteration(n) => ("iteration", n.to_string()),
         };
         Ok(Event::default().event(etype).data(data))
     });
@@ -523,6 +532,142 @@ async fn get_project(
     })
 }
 
+#[derive(Serialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub status: Option<String>,
+}
+
+async fn list_files(
+    AxumState(state): AxumState<ApiState>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let dir = state.project_dir.read().await.clone().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "no project set".into(),
+            }),
+        )
+    })?;
+
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("find . -maxdepth 4 -type f -not -path '*/target/*' -not -path '*/.git/*' -not -path '*/node_modules/*' 2>/dev/null | sed 's|^\\./||' | sort | head -300")
+        .current_dir(&dir)
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e.to_string() }),
+            )
+        })?;
+
+    let status_out = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("git status --porcelain 2>/dev/null")
+        .current_dir(&dir)
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let mut status_map = std::collections::HashMap::new();
+    for line in status_out.lines() {
+        if line.len() >= 4 {
+            let st = line[..2].trim().to_string();
+            let path = line[3..].to_string();
+            let action = match st.as_str() {
+                "M" | "MM" | " M" => "modified",
+                "A" | "??" => "added",
+                "D" => "deleted",
+                _ => "changed",
+            };
+            status_map.insert(path, action.to_string());
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let entries: Vec<FileEntry> = stdout
+        .lines()
+        .map(|p| FileEntry {
+            path: p.to_string(),
+            status: status_map.get(p).cloned(),
+        })
+        .collect();
+
+    Ok(Json(entries))
+}
+
+#[derive(Deserialize)]
+pub struct ReadFileQuery {
+    pub path: String,
+}
+
+async fn read_file(
+    AxumState(state): AxumState<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<ReadFileQuery>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let dir = state.project_dir.read().await.clone().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "no project set".into(),
+            }),
+        )
+    })?;
+
+    let full = dir.join(&q.path);
+    let canonical = full.canonicalize().map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: e.to_string() }),
+        )
+    })?;
+    if !canonical.starts_with(&dir) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "outside project".into(),
+            }),
+        ));
+    }
+    let content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e.to_string() }),
+        )
+    })?;
+
+    Ok(content)
+}
+
+async fn get_diff(
+    AxumState(state): AxumState<ApiState>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let dir = state.project_dir.read().await.clone().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "no project set".into(),
+            }),
+        )
+    })?;
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("git diff HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | xargs -I {} sh -c 'echo \"--- /dev/null\"; echo \"+++ b/{}\"; cat {} | head -200'")
+        .current_dir(&dir)
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e.to_string() }),
+            )
+        })?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Chat UI
 // ---------------------------------------------------------------------------
@@ -536,48 +681,173 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>rustliza</title>
+<title>botdick</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#1a1a2e;--surface:#16213e;--input-bg:#0f3460;--accent:#e94560;--text:#eee;--dim:#888;--user-bg:#0f3460;--bot-bg:#1a1a2e;--border:#2a2a4a;--tool:#264653;--tool-border:#2a9d8f}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,monospace;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
-header{padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;background:var(--surface)}
-header .dot{width:10px;height:10px;border-radius:50%;background:#4ade80;flex-shrink:0}
-header h1{font-size:16px;font-weight:600}
-header .bio{font-size:12px;color:var(--dim);margin-left:auto;max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#messages{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:8px}
-.msg{max-width:80%;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.5;word-wrap:break-word;white-space:pre-wrap}
-.msg.user{align-self:flex-end;background:var(--user-bg);border:1px solid var(--border);border-bottom-right-radius:4px}
-.msg.bot{align-self:flex-start;background:var(--bot-bg);border:1px solid var(--border);border-bottom-left-radius:4px}
-.msg.bot .name{font-size:11px;color:var(--accent);margin-bottom:4px;font-weight:600}
-.msg.tool{align-self:flex-start;background:var(--tool);border:1px solid var(--tool-border);font-size:12px;max-width:90%;border-radius:6px}
-.msg.tool .label{font-size:10px;color:var(--tool-border);font-weight:700;text-transform:uppercase;margin-bottom:2px}
-.msg.system{align-self:center;color:var(--dim);font-size:12px;background:none;padding:4px}
-@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
-#input-area{padding:12px 20px;border-top:1px solid var(--border);background:var(--surface);display:flex;gap:8px}
-#input{flex:1;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-size:14px;font-family:inherit;outline:none;resize:none;max-height:120px}
+:root{
+  --bg:#0a0a0f;--panel:#101018;--panel-2:#15151f;--border:#1f1f2e;
+  --text:#e4e4e7;--dim:#71717a;--dim2:#a1a1aa;
+  --accent:#ec4899;--accent-2:#a78bfa;
+  --green:#10b981;--yellow:#eab308;--red:#ef4444;--blue:#3b82f6;
+  --added:#10b98122;--modified:#eab30822;--deleted:#ef444422;
+  --added-fg:#34d399;--modified-fg:#fbbf24;--deleted-fg:#f87171;
+}
+html,body{height:100%;overflow:hidden}
+body{font-family:'SF Pro Text','Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);font-size:13px;line-height:1.5}
+.mono{font-family:'SF Mono','JetBrains Mono','Fira Code',Monaco,monospace}
+
+/* Layout */
+#app{display:grid;grid-template-rows:42px 1fr;height:100vh}
+#topbar{display:flex;align-items:center;padding:0 14px;gap:14px;background:var(--panel);border-bottom:1px solid var(--border);font-size:12px}
+#topbar .logo{font-weight:700;color:var(--accent);font-size:14px;letter-spacing:-0.02em}
+#topbar .sep{width:1px;height:18px;background:var(--border)}
+#topbar .pill{padding:3px 8px;border-radius:4px;background:var(--panel-2);color:var(--dim2);font-family:'SF Mono',monospace;font-size:11px;display:flex;align-items:center;gap:5px;cursor:pointer}
+#topbar .pill:hover{color:var(--text);background:var(--border)}
+#topbar .pill.active{background:#ec489922;color:var(--accent)}
+#topbar .dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+#topbar .spacer{flex:1}
+
+#main{display:grid;grid-template-columns:240px 1fr 380px;height:calc(100vh - 42px);overflow:hidden}
+
+/* Sidebar — file tree */
+#sidebar{background:var(--panel);border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column}
+#sidebar .header{padding:10px 14px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);font-weight:600;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+#sidebar .header button{background:none;border:none;color:var(--dim);font-size:13px;cursor:pointer}
+#sidebar .header button:hover{color:var(--text)}
+#tree{flex:1;overflow-y:auto;padding:6px 0;font-family:'SF Mono',monospace;font-size:12px}
+.tree-item{padding:2px 14px;cursor:pointer;color:var(--dim2);display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tree-item:hover{background:var(--panel-2);color:var(--text)}
+.tree-item.active{background:#ec489922;color:var(--accent)}
+.tree-item .badge{margin-left:auto;font-size:9px;padding:1px 5px;border-radius:3px;font-weight:700}
+.tree-item .badge.modified{background:var(--modified);color:var(--modified-fg)}
+.tree-item .badge.added{background:var(--added);color:var(--added-fg)}
+.tree-item .badge.deleted{background:var(--deleted);color:var(--deleted-fg)}
+
+/* Center — activity feed */
+#center{display:flex;flex-direction:column;background:var(--bg);overflow:hidden}
+#feed{flex:1;overflow-y:auto;padding:18px 22px;display:flex;flex-direction:column;gap:10px}
+#feed::-webkit-scrollbar,#tree::-webkit-scrollbar,#viewer::-webkit-scrollbar,#sidebar::-webkit-scrollbar{width:8px;height:8px}
+#feed::-webkit-scrollbar-thumb,#tree::-webkit-scrollbar-thumb,#viewer::-webkit-scrollbar-thumb,#sidebar::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+.entry{display:flex;gap:10px;align-items:flex-start;animation:slidein .18s ease}
+@keyframes slidein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.entry .icon{width:22px;height:22px;border-radius:5px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:11px;font-weight:700}
+.entry .body{flex:1;min-width:0}
+.entry .head{font-size:11px;color:var(--dim);margin-bottom:3px;display:flex;align-items:center;gap:6px;font-weight:600}
+.entry .content{font-size:13px;color:var(--text);word-break:break-word}
+
+.entry.user .icon{background:#ec489922;color:var(--accent)}
+.entry.user .content{background:var(--panel);border:1px solid var(--border);padding:10px 12px;border-radius:8px}
+
+.entry.agent .icon{background:#a78bfa22;color:var(--accent-2)}
+.entry.agent .content{background:var(--panel);border:1px solid var(--border);padding:10px 12px;border-radius:8px;white-space:pre-wrap}
+
+.entry.system .icon{background:var(--panel-2);color:var(--dim)}
+.entry.system .content{font-size:12px;color:var(--dim2)}
+
+.entry.tool .icon{background:#3b82f622;color:var(--blue)}
+.entry.tool .content{padding:8px 12px;background:var(--panel);border:1px solid var(--border);border-radius:6px;font-family:'SF Mono',monospace;font-size:12px;color:var(--dim2)}
+.entry.tool .content .name{color:var(--blue);font-weight:700;margin-right:8px}
+
+.entry.output{margin-left:32px}
+.entry.output .icon{display:none}
+.entry.output .body{padding-left:0}
+.entry.output .content{background:var(--panel-2);border:1px solid var(--border);border-radius:6px;font-family:'SF Mono',monospace;font-size:11.5px;color:var(--dim2);padding:8px 12px;white-space:pre;overflow-x:auto;max-height:300px;overflow-y:auto}
+
+.entry.workspace .icon{background:#10b98122;color:var(--green)}
+.entry.workspace .content{background:#10b98111;border:1px solid #10b98144;color:var(--text);padding:8px 12px;border-radius:6px;font-family:'SF Mono',monospace;font-size:12px}
+
+.entry.file-changed .icon{display:none}
+.entry.file-changed{margin-left:32px}
+.entry.file-changed .content{font-size:12px;color:var(--dim2);font-family:'SF Mono',monospace}
+.entry.file-changed .action{font-weight:700;margin-right:6px}
+.entry.file-changed .action.modified{color:var(--modified-fg)}
+.entry.file-changed .action.added{color:var(--added-fg)}
+.entry.file-changed .action.deleted{color:var(--deleted-fg)}
+
+.entry.done .icon{background:#10b98122;color:var(--green)}
+.entry.done .content{background:#10b98111;border:1px solid #10b98144;padding:10px 12px;border-radius:6px;color:var(--text)}
+
+.entry.error .icon{background:#ef444422;color:var(--red)}
+.entry.error .content{background:#ef444411;border:1px solid #ef444444;padding:8px 12px;border-radius:6px;color:var(--red);font-family:'SF Mono',monospace;font-size:12px}
+
+.iter-divider{display:flex;align-items:center;gap:10px;margin:6px 0;color:var(--dim);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em}
+.iter-divider::before,.iter-divider::after{content:'';flex:1;height:1px;background:var(--border)}
+
+#composer{padding:14px 22px;border-top:1px solid var(--border);background:var(--panel)}
+#composer-row{display:flex;gap:10px;align-items:flex-end}
+#input{flex:1;background:var(--panel-2);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-size:13px;font-family:inherit;outline:none;resize:none;min-height:38px;max-height:150px;line-height:1.5}
 #input:focus{border-color:var(--accent)}
 #input::placeholder{color:var(--dim)}
-#send{background:var(--accent);color:#fff;border:none;padding:10px 20px;border-radius:8px;font-size:14px;cursor:pointer;font-family:inherit;font-weight:600;transition:opacity .15s}
-#send:hover{opacity:.85}
+#send{background:var(--accent);color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;font-weight:600;height:38px}
+#send:hover{opacity:.9}
 #send:disabled{opacity:.4;cursor:default}
+#hint{margin-top:6px;font-size:11px;color:var(--dim);font-family:'SF Mono',monospace}
+.hint-cmd{color:var(--accent-2);font-weight:600}
+
+/* Right panel — viewer */
+#right{background:var(--panel);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+#right .tabs{display:flex;border-bottom:1px solid var(--border);background:var(--panel-2)}
+#right .tab{padding:10px 14px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);font-weight:600;cursor:pointer;border-bottom:2px solid transparent}
+#right .tab.active{color:var(--text);border-bottom-color:var(--accent)}
+#right .tab:hover{color:var(--text)}
+#viewer{flex:1;overflow:auto;padding:14px;font-family:'SF Mono',monospace;font-size:11.5px;line-height:1.55;color:var(--dim2);white-space:pre;tab-size:4}
+#viewer .empty{color:var(--dim);font-style:italic;text-align:center;padding:40px 0;white-space:normal}
+.diff-line.add{background:#10b98122;color:var(--added-fg)}
+.diff-line.del{background:#ef444422;color:var(--deleted-fg)}
+.diff-line.hunk{color:var(--blue);font-weight:600}
+.diff-line.file{color:var(--accent);font-weight:700;margin-top:8px}
+.line-num{display:inline-block;width:42px;color:var(--dim);text-align:right;padding-right:12px;user-select:none;opacity:.6}
 </style>
 </head>
 <body>
-<header>
-  <div class="dot" id="status-dot"></div>
-  <h1 id="agent-name">connecting...</h1>
-  <div class="bio" id="agent-bio"></div>
-</header>
-<div id="messages"></div>
-<div id="input-area">
-  <textarea id="input" rows="1" placeholder="chat or /code &lt;task&gt; for autonomous coding..." disabled></textarea>
-  <button id="send" disabled>send</button>
+<div id="app">
+  <div id="topbar">
+    <div class="logo">▮ botdick</div>
+    <div class="sep"></div>
+    <div class="pill" id="agent-status"><span class="dot"></span><span id="agent-name">connecting</span></div>
+    <div class="pill" id="project-pill" title="click to change project">no project</div>
+    <div class="pill" id="branch-pill" style="display:none">main</div>
+    <div class="spacer"></div>
+    <div class="pill" id="iter-pill" style="display:none">idle</div>
+  </div>
+
+  <div id="main">
+    <div id="sidebar">
+      <div class="header">
+        Files
+        <button id="refresh-tree" title="refresh">↻</button>
+      </div>
+      <div id="tree"><div style="padding:14px;color:var(--dim);font-size:12px">no project set</div></div>
+    </div>
+
+    <div id="center">
+      <div id="feed"></div>
+      <div id="composer">
+        <div id="composer-row">
+          <textarea id="input" rows="1" placeholder="ask anything · /code <task> · /project <path>" disabled></textarea>
+          <button id="send" disabled>send</button>
+        </div>
+        <div id="hint"><span class="hint-cmd">/code</span> &lt;task&gt; — autonomous build · <span class="hint-cmd">/project</span> &lt;path&gt; — set workspace · <span class="hint-cmd">/diff</span> — show changes</div>
+      </div>
+    </div>
+
+    <div id="right">
+      <div class="tabs">
+        <div class="tab active" data-view="diff">Diff</div>
+        <div class="tab" data-view="file">File</div>
+      </div>
+      <div id="viewer"><div class="empty">select a file or run /diff</div></div>
+    </div>
+  </div>
 </div>
+
 <script>
 const $ = s => document.querySelector(s);
-const msgs = $('#messages');
+const $$ = s => document.querySelectorAll(s);
+
 let roomId = null, entityId = null, agentName = 'bot', streaming = false;
+let currentView = 'diff', currentFile = null;
 
 function uuid() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -586,82 +856,211 @@ function uuid() {
   });
 }
 
-function addMsg(text, cls, name) {
-  const d = document.createElement('div');
-  d.className = 'msg ' + cls;
-  if (name) {
-    const n = document.createElement('div');
-    n.className = 'name';
-    n.textContent = name;
-    d.appendChild(n);
+function el(tag, attrs={}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k === 'style') e.style.cssText = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
   }
-  const t = document.createElement('span');
-  t.textContent = text;
-  d.appendChild(t);
-  msgs.appendChild(d);
-  msgs.scrollTop = msgs.scrollHeight;
-  return t;
+  for (const c of children) {
+    if (c == null) continue;
+    e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return e;
 }
 
-function addTool(label, text) {
-  const d = document.createElement('div');
-  d.className = 'msg tool';
-  const l = document.createElement('div');
-  l.className = 'label';
-  l.textContent = label;
-  d.appendChild(l);
-  const t = document.createElement('span');
-  t.textContent = text.length > 500 ? text.slice(0, 500) + '...' : text;
-  d.appendChild(t);
-  msgs.appendChild(d);
-  msgs.scrollTop = msgs.scrollHeight;
+const feed = () => $('#feed');
+const scrollFeed = () => { const f = feed(); f.scrollTop = f.scrollHeight; };
+
+function addEntry(type, body, opts={}) {
+  const icons = {user:'You', agent:'A', system:'·', tool:'⚙', output:'', workspace:'⎇', done:'✓', error:'!', 'file-changed':''};
+  const head = opts.head || '';
+  const e = el('div', {class:'entry '+type});
+  if (icons[type]) e.appendChild(el('div', {class:'icon'}, icons[type]));
+  else e.appendChild(el('div', {class:'icon'}));
+  const inner = el('div', {class:'body'});
+  if (head) inner.appendChild(el('div', {class:'head'}, head));
+  inner.appendChild(typeof body === 'string' ? el('div', {class:'content'}, body) : body);
+  e.appendChild(inner);
+  feed().appendChild(e);
+  scrollFeed();
+  return e;
 }
 
-function addSystem(text) { addMsg(text, 'system'); }
+function addIterDivider(n) {
+  const d = el('div', {class:'iter-divider'}, 'iteration ' + n);
+  feed().appendChild(d);
+  scrollFeed();
+}
+
+function addToolEntry(toolText) {
+  const colon = toolText.indexOf(':');
+  const name = colon > 0 ? toolText.slice(0, colon) : toolText;
+  const arg = colon > 0 ? toolText.slice(colon+1).trim() : '';
+  const content = el('div', {class:'content'},
+    el('span', {class:'name'}, name),
+    el('span', {}, arg)
+  );
+  return addEntry('tool', content);
+}
+
+function addFileChanged(path, action) {
+  const content = el('div', {class:'content'},
+    el('span', {class:'action '+action}, action),
+    el('span', {}, path)
+  );
+  return addEntry('file-changed', content);
+}
 
 async function init() {
   try {
     const agent = await (await fetch('/agent')).json();
     agentName = agent.name;
     $('#agent-name').textContent = agent.name;
-    $('#agent-bio').textContent = agent.bio;
     entityId = uuid();
     const room = await (await fetch('/rooms', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({name:'chat-' + Date.now(), source:'web'})
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:'web-' + Date.now(), source:'web'})
     })).json();
     roomId = room.id;
+
+    // Check if project is already set
+    const proj = await (await fetch('/project')).json();
+    if (proj.path) {
+      $('#project-pill').textContent = proj.path.split('/').pop();
+      $('#project-pill').title = proj.path;
+      await refreshTree();
+    }
+
     $('#input').disabled = false;
     $('#send').disabled = false;
     $('#input').focus();
-    addSystem('connected. /project <path> to set working dir, /code <task> for autonomous coding.');
+
+    addEntry('system', `connected as ${agent.name}. ${proj.path ? 'project: ' + proj.path : 'set a project with /project <path>'}`);
   } catch(e) {
     $('#agent-name').textContent = 'offline';
-    $('#status-dot').style.background = '#ef4444';
-    addSystem('failed to connect: ' + e.message);
+    $('#agent-status .dot').style.background = 'var(--red)';
+    addEntry('error', 'failed to connect: ' + e.message);
   }
+}
+
+async function refreshTree() {
+  try {
+    const files = await (await fetch('/files')).json();
+    const tree = $('#tree');
+    tree.innerHTML = '';
+    if (!files.length) {
+      tree.appendChild(el('div', {style:'padding:14px;color:var(--dim);font-size:12px'}, 'empty'));
+      return;
+    }
+    for (const f of files) {
+      const item = el('div', {class:'tree-item', title:f.path, onclick:() => openFile(f.path)},
+        el('span', {}, f.path)
+      );
+      if (f.status) {
+        item.appendChild(el('span', {class:'badge '+f.status}, f.status[0].toUpperCase()));
+      }
+      tree.appendChild(item);
+    }
+  } catch(e) { /* ignore */ }
+}
+
+async function openFile(path) {
+  currentFile = path;
+  switchView('file');
+  $$('.tree-item').forEach(i => i.classList.toggle('active', i.title === path));
+  try {
+    const r = await fetch('/file?path=' + encodeURIComponent(path));
+    if (!r.ok) {
+      $('#viewer').innerHTML = '';
+      $('#viewer').appendChild(el('div', {class:'empty'}, 'cannot read: ' + r.statusText));
+      return;
+    }
+    const text = await r.text();
+    renderFile(text);
+  } catch(e) {
+    $('#viewer').textContent = 'error: ' + e.message;
+  }
+}
+
+function renderFile(text) {
+  const v = $('#viewer');
+  v.innerHTML = '';
+  const lines = text.split('\n');
+  const frag = document.createDocumentFragment();
+  lines.forEach((line, i) => {
+    const ln = el('div', {},
+      el('span', {class:'line-num'}, String(i+1)),
+      document.createTextNode(line)
+    );
+    frag.appendChild(ln);
+  });
+  v.appendChild(frag);
+}
+
+async function showDiff() {
+  switchView('diff');
+  try {
+    const r = await fetch('/diff');
+    const text = await r.text();
+    const v = $('#viewer');
+    v.innerHTML = '';
+    if (!text.trim()) {
+      v.appendChild(el('div', {class:'empty'}, 'no changes'));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    text.split('\n').forEach(line => {
+      let cls = '';
+      if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')) cls = 'file';
+      else if (line.startsWith('@@')) cls = 'hunk';
+      else if (line.startsWith('+')) cls = 'add';
+      else if (line.startsWith('-')) cls = 'del';
+      frag.appendChild(el('div', {class:'diff-line '+cls}, line));
+    });
+    v.appendChild(frag);
+  } catch(e) {
+    $('#viewer').textContent = 'error: ' + e.message;
+  }
+}
+
+function switchView(view) {
+  currentView = view;
+  $$('#right .tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
 }
 
 function parseSSE(buf, handler) {
   const lines = buf.split('\n');
   const rest = lines.pop();
-  let etype = '';
+  let etype = '', dataLines = [];
   for (const line of lines) {
-    if (line.startsWith('event: ')) etype = line.slice(7).trim();
-    else if (line.startsWith('data: ')) handler(etype, line.slice(6));
+    if (line.startsWith('event: ')) {
+      if (dataLines.length && etype) handler(etype, dataLines.join('\n'));
+      etype = line.slice(7).trim();
+      dataLines = [];
+    } else if (line.startsWith('data: ')) {
+      dataLines.push(line.slice(6));
+    } else if (line.trim() === '' && dataLines.length) {
+      handler(etype, dataLines.join('\n'));
+      etype = '';
+      dataLines = [];
+    }
   }
+  if (dataLines.length && etype) handler(etype, dataLines.join('\n'));
   return rest;
 }
 
 async function sendChat(text) {
-  const span = addMsg('', 'bot', agentName);
+  const e = addEntry('agent', '...', {head:agentName});
+  const span = e.querySelector('.content');
+  span.textContent = '';
   let full = '';
   try {
     const res = await fetch('/message/stream', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({text, room_id: roomId, entity_id: entityId})
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text, room_id: roomId, entity_id: entityId})
     });
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -669,29 +1068,31 @@ async function sendChat(text) {
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, {stream: true});
+      buf += decoder.decode(value, {stream:true});
       buf = parseSSE(buf, (etype, data) => {
-        if (etype === 'token') { full += data; span.textContent = full; msgs.scrollTop = msgs.scrollHeight; }
-        else if (etype === 'done') span.textContent = data || full;
+        if (etype === 'token') { full += data; span.textContent = full; scrollFeed(); }
+        else if (etype === 'done') span.textContent = data || full || '[no response]';
         else if (etype === 'error') span.textContent = full + '\n[error: ' + data + ']';
       });
     }
-  } catch(e) { span.textContent = full + '\n[stream error: ' + e.message + ']'; }
+  } catch(err) { span.textContent = full + '\n[error: ' + err.message + ']'; }
   if (!span.textContent) span.textContent = '[no response]';
 }
 
 async function sendTask(task) {
-  addSystem('starting coding task...');
-  let thinkSpan = null;
+  addEntry('system', 'starting: ' + task);
+  $('#iter-pill').style.display = 'inline-flex';
+  $('#iter-pill').textContent = 'starting...';
+  let lastIter = 0;
   try {
     const res = await fetch('/task', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({task})
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task})
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({error: res.statusText}));
-      addSystem('error: ' + (err.error || res.statusText));
+      const err = await res.json().catch(() => ({error:res.statusText}));
+      addEntry('error', err.error || res.statusText);
+      $('#iter-pill').style.display = 'none';
       return;
     }
     const reader = res.body.getReader();
@@ -700,30 +1101,61 @@ async function sendTask(task) {
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, {stream: true});
+      buf += decoder.decode(value, {stream:true});
       buf = parseSSE(buf, (etype, data) => {
-        if (etype === 'status') addSystem(data);
-        else if (etype === 'thinking') { thinkSpan = addMsg('', 'bot', agentName + ' [thinking]'); thinkSpan.textContent = data.length > 1000 ? data.slice(0,1000)+'...' : data; }
-        else if (etype === 'tool') addTool('tool', data);
-        else if (etype === 'output') addTool('output', data);
-        else if (etype === 'done') { addMsg(data, 'bot', agentName); addSystem('task complete.'); }
-        else if (etype === 'error') addSystem('error: ' + data);
+        if (etype === 'status') { $('#iter-pill').textContent = data; }
+        else if (etype === 'iteration') { lastIter = parseInt(data); $('#iter-pill').textContent = 'iter ' + data; addIterDivider(data); }
+        else if (etype === 'workspace') {
+          const ws = JSON.parse(data);
+          $('#branch-pill').style.display = 'inline-flex';
+          $('#branch-pill').textContent = '⎇ ' + ws.branch;
+          addEntry('workspace', 'branch: ' + ws.branch + ' · dir: ' + ws.dir);
+        }
+        else if (etype === 'thinking') {
+          if (data.trim()) addEntry('agent', data, {head: agentName});
+        }
+        else if (etype === 'tool') addToolEntry(data);
+        else if (etype === 'output') {
+          addEntry('output', el('div', {class:'content'}, data));
+        }
+        else if (etype === 'file-changed') {
+          const fc = JSON.parse(data);
+          addFileChanged(fc.path, fc.action);
+          refreshTree();
+        }
+        else if (etype === 'done') {
+          addEntry('done', data || 'task complete');
+          $('#iter-pill').textContent = 'done';
+          setTimeout(() => $('#iter-pill').style.display = 'none', 3000);
+          refreshTree();
+          if (currentView === 'diff') showDiff();
+        }
+        else if (etype === 'error') addEntry('error', data);
       });
     }
-  } catch(e) { addSystem('task stream error: ' + e.message); }
+  } catch(e) {
+    addEntry('error', 'stream error: ' + e.message);
+    $('#iter-pill').style.display = 'none';
+  }
+  refreshTree();
 }
 
 async function setProject(path) {
   try {
     const r = await fetch('/project', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({path})
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path})
     });
     const j = await r.json();
-    if (r.ok) addSystem('project set: ' + j.path);
-    else addSystem('error: ' + (j.error || 'failed'));
-  } catch(e) { addSystem('error: ' + e.message); }
+    if (r.ok) {
+      addEntry('system', 'project set: ' + j.path);
+      $('#project-pill').textContent = j.path.split('/').pop();
+      $('#project-pill').title = j.path;
+      await refreshTree();
+    } else {
+      addEntry('error', j.error || 'failed');
+    }
+  } catch(e) { addEntry('error', e.message); }
 }
 
 async function send() {
@@ -731,21 +1163,20 @@ async function send() {
   if (!text || streaming) return;
   $('#input').value = '';
   autoResize();
-  addMsg(text, 'user');
+  addEntry('user', text, {head:'you'});
   streaming = true;
   $('#send').disabled = true;
 
-  if (text.startsWith('/code ')) {
-    await sendTask(text.slice(6));
-  } else if (text.startsWith('/project ')) {
-    await setProject(text.slice(9).trim());
-  } else if (text === '/project') {
+  if (text.startsWith('/code ')) await sendTask(text.slice(6));
+  else if (text.startsWith('/project ')) await setProject(text.slice(9).trim());
+  else if (text === '/project') {
     const r = await fetch('/project');
     const j = await r.json();
-    addSystem(j.path ? 'project: ' + j.path : 'no project set. use /project <path>');
-  } else {
-    await sendChat(text);
+    addEntry('system', j.path ? 'project: ' + j.path : 'no project set');
   }
+  else if (text === '/diff') showDiff();
+  else if (text === '/refresh') await refreshTree();
+  else await sendChat(text);
 
   streaming = false;
   $('#send').disabled = false;
@@ -755,7 +1186,7 @@ async function send() {
 function autoResize() {
   const el = $('#input');
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+  el.style.height = Math.min(el.scrollHeight, 150) + 'px';
 }
 
 $('#send').addEventListener('click', send);
@@ -763,6 +1194,17 @@ $('#input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $('#input').addEventListener('input', autoResize);
+$('#refresh-tree').addEventListener('click', refreshTree);
+$$('#right .tab').forEach(tab => tab.addEventListener('click', () => {
+  if (tab.dataset.view === 'diff') showDiff();
+  else if (currentFile) openFile(currentFile);
+  else { switchView('file'); $('#viewer').innerHTML = ''; $('#viewer').appendChild(el('div', {class:'empty'}, 'select a file from the sidebar')); }
+}));
+$('#project-pill').addEventListener('click', async () => {
+  const path = prompt('project path:', $('#project-pill').title || '~/');
+  if (path) await setProject(path);
+});
+
 init();
 </script>
 </body>
@@ -783,6 +1225,9 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/webhook", post(webhook))
         .route("/task", post(run_task))
         .route("/project", get(get_project).post(set_project))
+        .route("/files", get(list_files))
+        .route("/file", get(read_file))
+        .route("/diff", get(get_diff))
         .route("/rooms", post(create_room))
         .route("/rooms/{room_id}", get(get_room))
         .route("/rooms/{room_id}/memories", get(get_memories))
