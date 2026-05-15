@@ -22,6 +22,9 @@ use rustliza_core::error::Result;
 use rustliza_core::traits::Runtime;
 use rustliza_core::types::*;
 use rustliza_plugin_coding::CodingEvent;
+use rustliza_plugin_vamp::VampState;
+
+mod vamp;
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -32,6 +35,7 @@ pub struct ApiState {
     pub runtime: Arc<dyn Runtime>,
     pub metrics: Option<Arc<rustliza_core::PipelineMetrics>>,
     pub project_dir: Arc<RwLock<Option<PathBuf>>>,
+    pub vamp: Option<Arc<VampState>>,
 }
 
 impl ApiState {
@@ -107,7 +111,7 @@ pub struct HealthResponse {
     pub version: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ErrorResponse {
     pub error: String,
 }
@@ -1231,6 +1235,7 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/rooms", post(create_room))
         .route("/rooms/{room_id}", get(get_room))
         .route("/rooms/{room_id}/memories", get(get_memories))
+        .merge(vamp::router())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1241,7 +1246,7 @@ pub fn create_router(state: ApiState) -> Router {
 // ---------------------------------------------------------------------------
 
 pub async fn start_server(runtime: Arc<dyn Runtime>, bind: &str) -> Result<()> {
-    start_server_with_options(runtime, bind, None).await
+    start_server_full(runtime, bind, None, None).await
 }
 
 pub async fn start_server_with_options(
@@ -1249,10 +1254,20 @@ pub async fn start_server_with_options(
     bind: &str,
     project_dir: Option<PathBuf>,
 ) -> Result<()> {
+    start_server_full(runtime, bind, project_dir, None).await
+}
+
+pub async fn start_server_full(
+    runtime: Arc<dyn Runtime>,
+    bind: &str,
+    project_dir: Option<PathBuf>,
+    vamp: Option<Arc<VampState>>,
+) -> Result<()> {
     let state = ApiState {
         runtime,
         metrics: None,
         project_dir: Arc::new(RwLock::new(project_dir)),
+        vamp,
     };
     let app = create_router(state);
 

@@ -21,6 +21,7 @@ use rustliza_knowledge::KnowledgeProvider;
 use rustliza_model_anthropic::AnthropicProvider;
 use rustliza_model_openai::OpenAIProvider;
 use rustliza_plugin_bootstrap::bootstrap_plugin;
+use rustliza_plugin_vamp::{vamp_plugin, VampConfig, VampState};
 
 #[derive(Parser)]
 #[command(name = "rustliza", about = "Rustliza — ElizaOS rewritten in Rust")]
@@ -155,6 +156,10 @@ async fn main() -> anyhow::Result<()> {
     db.init().await?;
     info!(path = ?cli.database, "database ready");
 
+    // Vamp shared state — survives the runtime so the API layer can read
+    // generated coins and flip auto-mode without going through SQLite.
+    let vamp_state = VampState::new(VampConfig::default());
+
     // Build runtime
     let agent_id = Uuid::new_v4();
     let mut builder = AgentRuntime::builder()
@@ -163,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         .database(db.clone() as Arc<dyn rustliza_core::DatabaseAdapter>)
         .model_provider(model_provider.clone())
         .plugin(bootstrap_plugin())
+        .plugin(vamp_plugin(vamp_state.clone()))
         .provider(Arc::new(KnowledgeProvider::new(
             db.clone() as Arc<dyn rustliza_core::DatabaseAdapter>,
             model_provider.clone(),
@@ -218,9 +224,10 @@ async fn main() -> anyhow::Result<()> {
         let rt = runtime.clone() as Arc<dyn Runtime>;
         let bind = cli.api_bind.clone();
         let project_dir = cli.project_dir.as_ref().and_then(|p| p.canonicalize().ok());
+        let vamp = vamp_state.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                rustliza_server_api::start_server_with_options(rt, &bind, project_dir).await
+                rustliza_server_api::start_server_full(rt, &bind, project_dir, Some(vamp)).await
             {
                 error!(error = %e, "API server error");
             }

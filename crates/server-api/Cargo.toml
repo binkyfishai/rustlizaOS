@@ -19,3 +19,4 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 rustliza-plugin-coding = { path = "../plugin-coding" }
+rustliza-plugin-vamp = { path = "../plugin-vamp" }

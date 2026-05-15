@@ -1,0 +1,23 @@
+[package]
+name = "rustliza-plugin-vamp"
+version = "0.1.0"
+edition = "2021"
+description = "Pseudo-vamp coin generator — trend curation + parody coin minting + listing page"
+
+[dependencies]
+rustliza-core = { path = "../core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+headless_chrome = "1"
+html-escape = "0.2"
+rand = "0.8"
+url = "2"
+regex = "1"
