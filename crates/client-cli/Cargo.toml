@@ -20,6 +20,7 @@ rustliza-client-discord = { path = "../client-discord" }
 rustliza-client-telegram = { path = "../client-telegram" }
 rustliza-client-twitter = { path = "../client-twitter" }
 rustliza-plugin-coding = { path = "../plugin-coding" }
+rustliza-plugin-vamp = { path = "../plugin-vamp" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
